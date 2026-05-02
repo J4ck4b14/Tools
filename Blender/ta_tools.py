@@ -8,10 +8,17 @@ bl_info = {
 }
 
 import bpy
+import bmesh
 from mathutils import Vector
 
 def get_extreme_vertex(obj, axis_str):
-        """Finds the axis-most vertex of the given axis (+-X, +-Y, +-Z) or the mid point"""
+        """
+        Finds the axis-most vertex of the given axis (+-X, +-Y, +-Z) or the mid point
+        """
+
+        if not obj.data.vertices:
+            return obj.matrix_world.translation.copy()
+        
         bpy.ops.object.mode_set(mode="OBJECT")
 
         if axis_str == "MID":
@@ -34,6 +41,36 @@ def get_extreme_vertex(obj, axis_str):
 
         print(world_co)
         return world_co
+
+def get_selection_extreme_vertex(objs, axis_str):
+    mesh_objs = [obj for obj in objs if \
+                 obj.type == "MESH" and obj.data.vertices]
+    
+    if not mesh_objs:
+        return None
+    
+    if axis_str == "MID":
+        coords = []
+
+        for obj in mesh_objs:
+            for vert in obj.data.vertices:
+                coords.append(obj.matrix_world @ vert.co)
+        
+        return sum(coords, Vector()) / len(coords)
+    
+    axis_index = {'X': 0, 'Y': 1, 'Z':2}[axis_str[-1]]
+    find_max = not axis_str.startswith('-')
+
+    extreme_points = [
+        get_extreme_vertex(obj, axis_str)
+        for obj in mesh_objs
+    ]
+
+    if find_max:
+        return max(extreme_points, key=lambda co: co[axis_index])
+    
+    return min(extreme_points, key=lambda co: co[axis_index])
+    
 
 def update_axis(self, context):
     #This function just forces the UI redraw
@@ -270,6 +307,65 @@ def draw_budget_marker(layout, context):
         icon = classification["icon"]
     )
 
+def get_non_manifold_edges(obj):
+    """
+    Returns non-manifold edge data for a mesh object.
+
+    Handled categories:
+    - wire: edge with no faces
+    - boundary: edge has just one face
+    - multiface: edge has more than two faces
+    - non_contiguous: edge has two faces but is still not manifold (weird, but can happen)
+    """
+
+    if obj is None or obj.type != "MESH":
+        return None
+    
+    mesh = obj.data
+
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    bm.edges.index_update()
+
+    bad_edges = []
+    wire_edges = []
+    boundary_edges = []
+    multiface_edges = []
+    non_contiguous_edges = []
+
+    try:
+        for edge in bm.edges:
+            face_count = len(edge.link_faces)
+
+            if edge.is_manifold:
+                continue
+
+            bad_edges.append(edge.index)
+
+            if face_count == 0:
+                wire_edges.append(edge.index)
+            elif face_count == 1:
+                boundary_edges.append(edge.index)
+            elif face_count > 2:
+                multiface_edges.append(edge.index)
+            else:
+                non_contiguous_edges.append(edge.index)
+            
+        return {
+            "bad_edges": bad_edges,
+            "wire_edges": wire_edges,
+            "boundary_edges": boundary_edges,
+            "multiface_edges": multiface_edges,
+            "non_contiguous_edges": non_contiguous_edges,
+        }
+    finally:
+        bm.free()
+
+
 class TA_OT_rename_selected(bpy.types.Operator):
     bl_idname = "ta.rename_selected"
     bl_label = "Rename Selected"
@@ -405,47 +501,211 @@ class TA_OT_move_origin(bpy.types.Operator):
         return context.active_object is not None and context.active_object.type == "MESH"
 
     def execute(self, context):
-        if not context.active_object or context.active_object.type != "MESH":
-            self.report({"WARNING"}, "No active mesh object")
+        selected_meshes = get_selected_meshes(context)
+        if not selected_meshes:
+            self.report({"WARNING"}, "No selected mesh objects")
             return {"CANCELLED"}
+        
+        if context.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
 
+        context.view_layer.objects.active = selected_meshes[0]
         bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
 
-        obj = context.active_object
-        mesh = obj.data
-        target_co = obj.matrix_world.translation.copy()
+        scene = context.scene
 
-        x_axis = context.scene.x_axis
-        if x_axis != "NA":
-            obj = context.active_object
-            extreme_vertex = Vector((get_extreme_vertex(obj, x_axis)))
-            target_co.x = extreme_vertex.x
-        
-        y_axis = context.scene.y_axis
-        if y_axis != "NA":
-            obj = context.active_object
-            extreme_vertex = Vector((get_extreme_vertex(obj, y_axis)))
-            target_co.y = extreme_vertex.y
-        
-        z_axis = context.scene.z_axis
-        if z_axis != "NA":
-            obj = context.active_object
-            extreme_vertex = Vector((get_extreme_vertex(obj, z_axis)))
-            target_co.z = extreme_vertex.z
+        axis = [
+            (scene.x_axis, 0),
+            (scene.y_axis, 1),
+            (scene.z_axis, 2),
+        ]
 
-        offset = target_co - obj.matrix_world.translation
+        moved_count = 0
 
-        #Move mesh geometry against the origin movement, so the visual stays the same
-        for v in mesh.vertices:
-            v.co -= offset
+        if scene.individual_toggle:
+            for obj in selected_meshes:
+                target_co = obj.matrix_world.translation.copy()
 
-        if obj.matrix_world.translation == target_co:
-            self.report({"INFO"}, "No changes were needed")
+                for axis_choice, axis_index in axis:
+                    if axis_choice == "NA":
+                        continue
+
+                    extreme_vertex = get_extreme_vertex(obj, axis_choice)
+                    target_co[axis_index] = extreme_vertex[axis_index]
+
+                offset = target_co - obj.matrix_world.translation
+
+                for vert in obj.data.vertices:
+                    vert.co -= offset
+
+                if obj.matrix_world.translation != target_co:
+                    obj.matrix_world.translation = target_co
+                    obj.data.update()
+                    moved_count += 1
+            
+            self.report(
+                {"INFO"},
+                f"Moved origins individually on {moved_count} object(s)"
+            )
+
         else:
-            obj.matrix_world.translation = target_co
-            self.report({"INFO"}, "Origin moved succesfully")
+            shared_values = {}
+
+            for axis_choice, axis_index in axis:
+                if axis_choice == "NA":
+                    continue
+
+                extreme_vertex = get_selection_extreme_vertex(
+                    selected_meshes,
+                    axis_choice
+                )
+
+                if extreme_vertex is not None:
+                    shared_values[axis_index] = extreme_vertex[axis_index]
+
+            for obj in selected_meshes:
+                target_co = obj.matrix_world.translation.copy()
+
+                for axis_index, value in shared_values.items():
+                    target_co[axis_index] = value
+                
+                offset = target_co - obj.matrix_world.translation
+
+                for vert in obj.data.vertices:
+                    vert.co -= offset
+
+                if obj.matrix_world.translation != target_co:
+                    obj.matrix_world.translation = target_co
+                    obj.data.update()
+                    moved_count += 1
+
+            self.report(
+                {"INFO"},
+                f"Moved origins to shared point on {moved_count} object(s)"
+            )
         
         return {"FINISHED"}
+
+class TA_OT_check_non_manifold(bpy.types.Operator):
+    bl_idname = "ta.check_non_manifold"
+    bl_label = "Check Non-Manifold"
+    bl_description = "Checks selected geometry for non-manifolds"
+    bl_options = {"REGISTER", "UNDO"}
+
+    select_first_issue: bpy.props.BoolProperty(
+        name = "Select First Issue",
+        description = "Select first problematic object and highlight its non-manifold",
+        default = True
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return any(obj.type == "MESH" for obj in context.selected_objects)
+    
+    def execute(self, context):
+        selected_meshes = get_selected_meshes(context)
+
+        if not selected_meshes:
+            self.report({"WARNING"}, "No mesh objects selected")
+            return {"CANCELLED"}
+        
+        if context.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+
+        problem_objects = []
+        total_bad_edges = 0
+
+        for obj in selected_meshes:
+            result = get_non_manifold_edges(obj)
+
+            if result is None:
+                continue
+
+            bad_count = len(result["bad_edges"])
+
+            if bad_count == 0:
+                continue
+
+            total_bad_edges += bad_count
+            
+            problem_objects.append({
+                "object": obj,
+                "result": result,
+                "bad_count": bad_count,
+            })
+
+        if not problem_objects:
+            context.scene.ta_validation_message = "Clean: no non-manifolds"
+            self.report({"INFO"}, "No non-manifold geometry found")
+            return {"FINISHED"}
+        
+        report_lines = []
+
+        for item in problem_objects:
+            obj = item["object"]
+            result = item["result"]
+
+            wire_count = len(result["wire_edges"])
+            boundary_count = len(result["boundary_edges"])
+            multiface_count = len(result["multiface_edges"])
+            non_contiguous_count = len(result["non_contiguous_edges"])
+
+            line = (
+                f"{obj.name}: "
+                f"{item['bad_count']} bad edges "
+                f"(wire: {wire_count}, "
+                f"boundary: {boundary_count}, "
+                f"multiface: {multiface_count}, "
+                f"other: {non_contiguous_count})"
+            )
+
+            report_lines.append(line)
+
+        print("TA Tools - Non-Manifold Report")
+        print("------------------------------")
+        for line in report_lines:
+            print(line)
+
+        context.scene.ta_validation_message = " | ".join(report_lines)
+
+        if self.select_first_issue:
+            first_problem = problem_objects[0]
+            obj = first_problem["object"]
+            bad_edges = first_problem["result"]["bad_edges"]
+
+            for selected_obj in context.selected_objects:
+                selected_obj.select_set(False)
+
+            obj.select_set(True)
+            context.view_layer.objects.active = obj
+
+            mesh = obj.data
+
+            for vert in mesh.vertices:
+                vert.select = False
+
+            for edge in mesh.edges:
+                edge.select = False
+            
+            for poly in mesh.polygons:
+                poly.select = False
+
+            for edge_index in bad_edges:
+                if edge_index < len(mesh.edges):
+                    mesh.edges[edge_index].select = True
+
+            mesh.update()
+            bpy.ops.object.mode_set(mode="EDIT")
+            bpy.ops.mesh.select_mode(type="EDGE")
+
+        self.report(
+            {"WARNING"},
+            f"Found {total_bad_edges} non-manifold edges in {len(problem_objects)} object(s)"
+        )
+
+        return {"FINISHED"}
+
+        
 
 class TA_PT_easy_export(bpy.types.Panel):
     bl_label = "Easy Export"
@@ -503,16 +763,30 @@ class TA_PT_easy_export(bpy.types.Panel):
         layout.prop(scene, "individual_toggle")
 
         layout.separator()
+        validation_box = layout.box()
+        validation_box.label(text="Validation", icon="CHECKMARK")
+
+        row = validation_box.row(align=True)
+        row.operator("ta.check_non_manifold", text = "Check Non-Manifold", icon="ERROR")
+
+        if scene.ta_validation_message:
+            warning_row = validation_box.row()
+            warning_row.alert = "Clean:" not in scene.ta_validation_message
+            warning_row.label(text=scene.ta_validation_message, icon="INFO")
+
+        layout.separator()
         layout.prop(scene, "ee_export_path")
         layout.operator("ta.export_selected", text = "Export")
 
 def register():
     bpy.utils.register_class(TA_OT_rename_selected)
     bpy.utils.register_class(TA_OT_export_selected)
-    bpy.utils.register_class(TA_PT_tools_panel)
-    bpy.utils.register_class(TA_PT_rename_tool_panel)
     bpy.utils.register_class(TA_OT_move_origin)
     bpy.utils.register_class(TA_OT_unify)
+    bpy.utils.register_class(TA_OT_check_non_manifold)
+
+    bpy.utils.register_class(TA_PT_tools_panel)
+    bpy.utils.register_class(TA_PT_rename_tool_panel)
     bpy.utils.register_class(TA_PT_easy_export)
 
     bpy.types.Scene.rs_prefix = bpy.props.StringProperty(
@@ -610,7 +884,13 @@ def register():
         default = "//"
     )
 
+    bpy.types.Scene.ta_validation_message = bpy.props.StringProperty(
+        name="Validation Message",
+        default=""
+    )
+
 def unregister():
+    del bpy.types.Scene.ta_validation_message
     del bpy.types.Scene.ee_export_path
     del bpy.types.Scene.ee_hp_prefix
     del bpy.types.Scene.ee_lp_prefix
@@ -629,10 +909,12 @@ def unregister():
     del bpy.types.Scene.rs_prefix
 
     bpy.utils.unregister_class(TA_PT_easy_export)
-    bpy.utils.unregister_class(TA_OT_unify)
-    bpy.utils.unregister_class(TA_OT_move_origin)
     bpy.utils.unregister_class(TA_PT_rename_tool_panel)
     bpy.utils.unregister_class(TA_PT_tools_panel)
+
+    bpy.utils.unregister_class(TA_OT_check_non_manifold)
+    bpy.utils.unregister_class(TA_OT_unify)
+    bpy.utils.unregister_class(TA_OT_move_origin)
     bpy.utils.unregister_class(TA_OT_export_selected)
     bpy.utils.unregister_class(TA_OT_rename_selected)
 
