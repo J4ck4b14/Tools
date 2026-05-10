@@ -135,6 +135,21 @@ def get_loop_normal(mesh, loop_index):
     loop = mesh.loops[loop_index]
     return get_rounded_tuple(loop.normal)
 
+def get_valid_uv_layers(mesh):
+    """
+    Returns only UV layers whose data length matches the mesh loop count.
+    Prevents uv_layer.data[loop_index] out-of-range errors.
+    """
+    loop_count = len(mesh.loops)
+
+    valid_layers = []
+
+    for uv_layer in mesh.uv_layers:
+        if len(uv_layer.data) == loop_count:
+            valid_layers.append(uv_layer)
+
+    return valid_layers
+
 def get_engine_vertex_estimate(obj, context):
     """
     Estimates engine-side render vertices.
@@ -157,6 +172,12 @@ def get_engine_vertex_estimate(obj, context):
         mesh = eval_obj.to_mesh()
         should_clear = True
     else:
+        if obj.mode == "EDIT":
+            try:
+                obj.update_from_editmode()
+            except Exception:
+                pass
+
         mesh = obj.data
         eval_obj = None
         should_clear = False
@@ -169,7 +190,7 @@ def get_engine_vertex_estimate(obj, context):
         if hasattr(mesh, "calc_normals_split"):
             mesh.calc_normals_split()
 
-        uv_layers = list(mesh.uv_layers)
+        uv_layers = get_valid_uv_layers(mesh)
 
         unique_render_vertices = set()
 
@@ -185,6 +206,9 @@ def get_engine_vertex_estimate(obj, context):
                 ]
 
                 for uv_layer in uv_layers:
+                    if loop_index >= len(uv_layer.data):
+                        continue
+
                     uv = uv_layer.data[loop_index].uv
                     key.append(get_rounded_tuple((uv.x, uv.y)))
 
@@ -274,6 +298,34 @@ def get_export_name_with_prefix(context, base_name):
     return export_name, count, classification
 
 
+def get_budget_count_label(scene):
+    return{
+        "ENGINE": "engine verts",
+        "TRIS": "tris",
+        "FACES": "faces",
+        "VERTS": "verts",
+    }.get(scene.ee_budget_count_mode, "items")
+
+def get_budget_signature(context):
+    """
+    Used only to warn that the cached count may be stale.
+    Checks selection and count settings, not mesh changes.
+    """
+    scene = context.scene
+    selected_meshes = get_selected_meshes(context)
+
+    object_part = "|".join(
+        f"{obj.name}:{obj.as_pointer()}:{obj.data.as_pointer()}"
+        for obj in selected_meshes
+    )
+
+    return "|".join([
+        scene.ee_budget_count_mode,
+        str(scene.ee_count_modifiers),
+        str(scene.ee_count_material_splits),
+        object_part,
+    ])
+
 def draw_budget_marker(layout, context):
     scene = context.scene
     mesh_objects = get_selected_meshes(context)
@@ -285,18 +337,31 @@ def draw_budget_marker(layout, context):
         row.label(text = "Poly budget: No mesh selected", icon="INFO")
         return
     
-    count = get_selection_metric(context)
-    classification = get_poly_classification(count, scene)
+    if not scene.ee_budget_cached_valid:
+        row.label(text = "Poly budget: Not calculated", icon = "INFO")
+        return
+    
+    cached_signature = get_budget_signature(context)
+    is_stale = cached_signature != scene.ee_budget_cached_signature
 
-    count_label = {
-        "ENGINE": "engine verts",
-        "TRIS": "tris",
-        "FACES": "faces",
-        "VERTS": "verts"
-    }.get(scene.ee_budget_count_mode, "items")
+    count = scene.ee_budget_cached_count
+    classification = get_poly_classification(count, scene)
+    count_label = get_budget_count_label(scene)
 
     if classification["state"] == "HIGH":
         row.alert = True
+
+    if is_stale:
+        row.alert=True
+        row.label(
+            text = (
+                f"Budget may be stale · "
+                f"{count:,}/{classification['limit']:,} {count_label}"
+                f"Press calculate"
+            ),
+            icon="FILE_REFRESH"
+        )
+        return
 
     row.label(
         text = (
@@ -364,6 +429,277 @@ def get_non_manifold_edges(obj):
         }
     finally:
         bm.free()
+
+def ta_get_edit_mesh_objects(context):
+    """
+    Returns mesh objects in edit mode.
+    Supports multi-object edit mode when available.
+    """
+    if context.mode != "EDIT_MESH":
+        return[]
+
+    objects = getattr(context, "objects_in_mode_unique_data", None)
+
+    if objects:
+        return [obj for obj in objects if obj and obj.type == "MESH"] 
+
+    if context.active_object and context.active_object.type == "MESH":
+        return [context.active_object]
+
+    return []
+
+def ta_get_bmesh_uv_layer(bm, uv_map_name):
+    """
+    Gets or creates a BMesh UV layer.
+    """   
+    uv_map_name = uv_map_name.strip()
+
+    if uv_map_name:
+        uv_layer = bm.loops.layers.uv.get(uv_map_name)
+
+        if uv_layer is None:
+            uv_layer = bm.loops.layers.uv.new(uv_map_name)
+
+        return uv_layer
+    
+    return bm.loops.layers.uv.verify()
+
+def ta_get_selected_face_islands(faces):
+    """
+    Splits selected faces into connected face islands.
+    This is geometry-island based, not existing UV-island based.
+    """
+    selected = set(faces)
+    visited = set()
+    islands = []
+
+    for start_face in faces:
+        if start_face in visited:
+            continue
+
+        island = []
+        stack = [start_face]
+        visited.add(start_face)
+
+        while stack:
+            face = stack.pop()
+            island.append(face)
+
+            for edge in face.edges:
+                for linked_face in edge.link_faces:
+                    if linked_face in selected and linked_face not in visited:
+                        visited.add(linked_face)
+                        stack.append(linked_face)
+
+        islands.append(island)
+    
+    return islands
+
+
+
+def ta_get_average_face_normal(obj, faces, space):
+    """
+    Area-weighted average normal for selected faces.
+    Used by the Normal / Best Fit projection.
+    """
+    normal = Vector((0.0, 0.0, 0.0))
+
+    normal_matrix = None
+
+    if space == "WORLD":
+        normal_matrix = obj.matrix_world.to_3x3().inverted().transposed()
+
+    for face in faces:
+        face_normal = face.normal.copy()
+
+        if space == "WORLD":
+            face_normal = normal_matrix @ face_normal
+
+        if face_normal.length_squared == 0.0:
+            continue
+
+        face_normal.normalize()
+        normal += face_normal * max(face.calc_area(), 0.000001)
+
+    if normal.length_squared == 0.0:
+        return Vector((0.0, 0.0, 1.0))
+
+    normal.normalize()
+    return normal
+
+
+def ta_get_basis_from_normal(normal):
+    """
+    Builds stable U/V projection axes from a normal.
+    """
+    normal = normal.normalized()
+
+    reference = Vector((0.0, 0.0, 1.0))
+
+    if abs(normal.dot(reference)) > 0.95:
+        reference = Vector((0.0, 1.0, 0.0))
+
+    u_axis = reference.cross(normal)
+
+    if u_axis.length_squared == 0.0:
+        u_axis = Vector((1.0, 0.0, 0.0))
+    else:
+        u_axis.normalize()
+
+    v_axis = normal.cross(u_axis)
+
+    if v_axis.length_squared == 0.0:
+        v_axis = Vector((0.0, 1.0, 0.0))
+    else:
+        v_axis.normalize()
+
+    return u_axis, v_axis
+
+
+def ta_get_projection_basis(obj, faces, projection_mode, space):
+    """
+    Returns U and V axes for planar projection.
+    """
+    if projection_mode == "XY":
+        return Vector((1.0, 0.0, 0.0)), Vector((0.0, 1.0, 0.0))
+
+    if projection_mode == "XZ":
+        return Vector((1.0, 0.0, 0.0)), Vector((0.0, 0.0, 1.0))
+
+    if projection_mode == "YZ":
+        return Vector((0.0, 1.0, 0.0)), Vector((0.0, 0.0, 1.0))
+
+    normal = ta_get_average_face_normal(obj, faces, space)
+    return ta_get_basis_from_normal(normal)
+
+
+def ta_get_loop_coord(obj, loop, space):
+    co = loop.vert.co.copy()
+
+    if space == "WORLD":
+        return obj.matrix_world @ co
+
+    return co
+
+
+def ta_normalize_projected_uv(u, v, bounds, preserve_aspect, padding):
+    min_u, max_u, min_v, max_v = bounds
+
+    span_u = max(max_u - min_u, 0.000001)
+    span_v = max(max_v - min_v, 0.000001)
+
+    if preserve_aspect:
+        size = max(span_u, span_v)
+
+        center_u = (min_u + max_u) * 0.5
+        center_v = (min_v + max_v) * 0.5
+
+        min_u = center_u - size * 0.5
+        min_v = center_v - size * 0.5
+
+        span_u = size
+        span_v = size
+
+    final_u = (u - min_u) / span_u
+    final_v = (v - min_v) / span_v
+
+    padding = max(0.0, min(padding, 0.49))
+    usable_space = 1.0 - padding * 2.0
+
+    final_u = padding + final_u * usable_space
+    final_v = padding + final_v * usable_space
+
+    return final_u, final_v
+
+
+def ta_apply_uv_post_transform(u, v, rotation, flip_u, flip_v):
+    """
+    Applies simple DCC-style UV post transforms.
+    """
+    if rotation == "90":
+        u, v = v, 1.0 - u
+    elif rotation == "180":
+        u, v = 1.0 - u, 1.0 - v
+    elif rotation == "270":
+        u, v = 1.0 - v, u
+
+    if flip_u:
+        u = 1.0 - u
+
+    if flip_v:
+        v = 1.0 - v
+
+    return u, v
+
+
+def ta_project_faces_to_uv(
+    obj,
+    faces,
+    uv_layer,
+    projection_mode,
+    space,
+    preserve_aspect,
+    padding,
+    rotation,
+    flip_u,
+    flip_v
+):
+    """
+    Projects a group of selected faces into UV space.
+    """
+    if not faces:
+        return 0
+
+    u_axis, v_axis = ta_get_projection_basis(
+        obj,
+        faces,
+        projection_mode,
+        space
+    )
+
+    projected_loops = []
+
+    min_u = float("inf")
+    max_u = float("-inf")
+    min_v = float("inf")
+    max_v = float("-inf")
+
+    for face in faces:
+        for loop in face.loops:
+            co = ta_get_loop_coord(obj, loop, space)
+
+            raw_u = co.dot(u_axis)
+            raw_v = co.dot(v_axis)
+
+            projected_loops.append((loop, raw_u, raw_v))
+
+            min_u = min(min_u, raw_u)
+            max_u = max(max_u, raw_u)
+            min_v = min(min_v, raw_v)
+            max_v = max(max_v, raw_v)
+
+    bounds = min_u, max_u, min_v, max_v
+
+    for loop, raw_u, raw_v in projected_loops:
+        final_u, final_v = ta_normalize_projected_uv(
+            raw_u,
+            raw_v,
+            bounds,
+            preserve_aspect,
+            padding
+        )
+
+        final_u, final_v = ta_apply_uv_post_transform(
+            final_u,
+            final_v,
+            rotation,
+            flip_u,
+            flip_v
+        )
+
+        loop[uv_layer].uv = (final_u, final_v)
+
+    return len(faces)
 
 
 class TA_OT_rename_selected(bpy.types.Operator):
@@ -705,6 +1041,124 @@ class TA_OT_check_non_manifold(bpy.types.Operator):
 
         return {"FINISHED"}
 
+
+class TA_OT_calculate_budget(bpy.types.Operator):
+    bl_label = "Calculate Budget"
+    bl_idname = "ta.calculate_budget"
+    bl_description = "Calculates the budget based on the user's settings."
+
+    @classmethod
+    def poll(cls, context):
+        return any(obj.type=="MESH" for obj in context.selected_objects)
+    
+    def execute(self, context):
+        scene = context.scene
+        selected_meshes = get_selected_meshes(context)
+
+        if not selected_meshes:
+            self.report({"WARNING"}, "No mesh objects selected")
+            return {"CANCELLED"}
+        
+        count = get_selection_metric(context)
+        classification = get_poly_classification(count, scene)
+
+        scene.ee_budget_cached_valid = True
+        scene.ee_budget_cached_count = count
+        scene.ee_budget_cached_mode = scene.ee_budget_count_mode
+        scene.ee_budget_cached_signature = get_budget_signature(context)
+        scene.ee_budget_cached_state = classification["state"]
+
+        self.report(
+            {"INFO"},
+            f"Budget calculated: {count:,} {get_budget_count_label(scene)}"
+        )
+
+        return {"FINISHED"}
+
+class TA_OT_planar_project_selected_uv(bpy.types.Operator):
+    bl_idname = "ta.planar_project_selected_uv"
+    bl_label = "Planar Project Selected UVs"
+    bl_description = "Planar-project UVs for selected edit-mode faces"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "EDIT_MESH" and bool(ta_get_edit_mesh_objects(context))
+
+    def execute(self, context):
+        scene = context.scene
+        edit_mesh_objects = ta_get_edit_mesh_objects(context)
+
+        if not edit_mesh_objects:
+            self.report({"WARNING"}, "Enter Edit Mode and select mesh faces")
+            return {"CANCELLED"}
+
+        total_faces = 0
+        total_islands = 0
+
+        for obj in edit_mesh_objects:
+            mesh = obj.data
+            bm = bmesh.from_edit_mesh(mesh)
+
+            bm.faces.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
+            bm.verts.ensure_lookup_table()
+
+            selected_faces = [
+                face for face in bm.faces
+                if face.select and not face.hide
+            ]
+
+            if not selected_faces:
+                continue
+
+            uv_layer = ta_get_bmesh_uv_layer(
+                bm,
+                scene.ta_uv_map_name
+            )
+
+            if scene.ta_uv_fit_mode == "ISLANDS":
+                face_groups = ta_get_selected_face_islands(selected_faces)
+            else:
+                face_groups = [selected_faces]
+
+            for faces in face_groups:
+                projected_count = ta_project_faces_to_uv(
+                    obj=obj,
+                    faces=faces,
+                    uv_layer=uv_layer,
+                    projection_mode=scene.ta_uv_projection_mode,
+                    space=scene.ta_uv_projection_space,
+                    preserve_aspect=scene.ta_uv_preserve_aspect,
+                    padding=scene.ta_uv_padding,
+                    rotation=scene.ta_uv_rotation,
+                    flip_u=scene.ta_uv_flip_u,
+                    flip_v=scene.ta_uv_flip_v
+                )
+
+                if projected_count > 0:
+                    total_faces += projected_count
+                    total_islands += 1
+
+            bmesh.update_edit_mesh(mesh)
+
+            if scene.ta_uv_map_name.strip():
+                uv_map = mesh.uv_layers.get(scene.ta_uv_map_name)
+
+                if uv_map:
+                    mesh.uv_layers.active = uv_map
+
+        if total_faces == 0:
+            self.report({"WARNING"}, "No selected faces found")
+            return {"CANCELLED"}
+
+        self.report(
+            {"INFO"},
+            f"Planar UV projected {total_faces} face(s) in {total_islands} group(s)"
+        )
+
+        return {"FINISHED"}
+
         
 
 class TA_PT_easy_export(bpy.types.Panel):
@@ -744,6 +1198,8 @@ class TA_PT_easy_export(bpy.types.Panel):
         row.prop(scene, "ee_lp_prefix")
         row.prop(scene, "ee_hp_prefix")
 
+        box.operator("ta.calculate_budget", icon="FILE_REFRESH")
+
         try:
             draw_budget_marker(box, context)
         except Exception as error:
@@ -775,6 +1231,32 @@ class TA_PT_easy_export(bpy.types.Panel):
             warning_row.label(text=scene.ta_validation_message, icon="INFO")
 
         layout.separator()
+
+        uv_box = layout.box()
+        uv_box.label(text="UV Planar Projection", icon="GROUP_UVS")
+
+        uv_box.prop(scene, "ta_uv_map_name")
+
+        row = uv_box.row(align=True)
+        row.prop(scene, "ta_uv_projection_mode", text="Projection")
+        row.prop(scene, "ta_uv_projection_space", text="Space")
+
+        uv_box.prop(scene, "ta_uv_fit_mode")
+        uv_box.prop(scene, "ta_uv_preserve_aspect")
+        uv_box.prop(scene, "ta_uv_padding")
+
+        row = uv_box.row(align=True)
+        row.prop(scene, "ta_uv_rotation")
+        row.prop(scene, "ta_uv_flip_u")
+        row.prop(scene, "ta_uv_flip_v")
+
+        uv_box.operator(
+            "ta.planar_project_selected_uv",
+            text="Project Selected Faces",
+            icon="GROUP_UVS"
+        )
+
+        layout.separator()
         layout.prop(scene, "ee_export_path")
         layout.operator("ta.export_selected", text = "Export")
 
@@ -784,6 +1266,8 @@ def register():
     bpy.utils.register_class(TA_OT_move_origin)
     bpy.utils.register_class(TA_OT_unify)
     bpy.utils.register_class(TA_OT_check_non_manifold)
+    bpy.utils.register_class(TA_OT_calculate_budget)
+    bpy.utils.register_class(TA_OT_planar_project_selected_uv)
 
     bpy.utils.register_class(TA_PT_tools_panel)
     bpy.utils.register_class(TA_PT_rename_tool_panel)
@@ -878,6 +1362,32 @@ def register():
         default = "HP"
     )
 
+    bpy.types.Scene.ee_budget_cached_valid = bpy.props.BoolProperty(
+        name = "Budget Cached Valid",
+        default = False
+    )
+
+    bpy.types.Scene.ee_budget_cached_count = bpy.props.IntProperty(
+        name = "Cached Budget Count",
+        default = 0,
+        min = 0
+    )
+
+    bpy.types.Scene.ee_budget_cached_mode = bpy.props.StringProperty(
+        name = "Cached Budget Mode",
+        default = ""
+    )
+
+    bpy.types.Scene.ee_budget_cached_signature = bpy.props.StringProperty(
+        name = "Cached Budget Signature",
+        default = ""
+    )
+
+    bpy.types.Scene.ee_budget_cached_state = bpy.props.StringProperty(
+        name = "Cached Budget State",
+        default = ""
+    )
+
     bpy.types.Scene.ee_export_path = bpy.props.StringProperty(
         name = "Export to:",
         subtype = "DIR_PATH",
@@ -889,9 +1399,98 @@ def register():
         default=""
     )
 
+    bpy.types.Scene.ta_uv_map_name = bpy.props.StringProperty(
+    name="UV Map",
+    description="UV map to create or overwrite",
+    default="TA_Planar"
+    )
+
+    bpy.types.Scene.ta_uv_projection_mode = bpy.props.EnumProperty(
+        name="Projection",
+        description="Planar projection mode",
+        items=[
+            ("XY", "XY", "Project onto XY plane"),
+            ("XZ", "XZ", "Project onto XZ plane"),
+            ("YZ", "YZ", "Project onto YZ plane"),
+            ("NORMAL", "Normal", "Best-fit projection from selected face normals"),
+        ],
+        default="NORMAL"
+    )
+
+    bpy.types.Scene.ta_uv_projection_space = bpy.props.EnumProperty(
+        name="Space",
+        description="Use local or world coordinates for projection",
+        items=[
+            ("LOCAL", "Local", "Use object-local coordinates"),
+            ("WORLD", "World", "Use world coordinates"),
+        ],
+        default="LOCAL"
+    )
+
+    bpy.types.Scene.ta_uv_fit_mode = bpy.props.EnumProperty(
+        name="Fit",
+        description="How selected faces are fitted into UV space",
+        items=[
+            ("SELECTION", "Selection", "Fit all selected faces as one projection"),
+            ("ISLANDS", "Islands", "Fit each connected selected face island separately"),
+        ],
+        default="SELECTION"
+    )
+
+    bpy.types.Scene.ta_uv_preserve_aspect = bpy.props.BoolProperty(
+        name="Preserve Aspect",
+        description="Preserve projected proportions",
+        default=True
+    )
+
+    bpy.types.Scene.ta_uv_padding = bpy.props.FloatProperty(
+        name="Padding",
+        description="Padding inside the 0-1 UV area",
+        default=0.02,
+        min=0.0,
+        max=0.49,
+        soft_max=0.25
+    )
+
+    bpy.types.Scene.ta_uv_rotation = bpy.props.EnumProperty(
+        name="Rotate",
+        description="Rotate projected UVs",
+        items=[
+            ("0", "0°", "No rotation"),
+            ("90", "90°", "Rotate 90 degrees"),
+            ("180", "180°", "Rotate 180 degrees"),
+            ("270", "270°", "Rotate 270 degrees"),
+        ],
+        default="0"
+    )
+
+    bpy.types.Scene.ta_uv_flip_u = bpy.props.BoolProperty(
+        name="Flip U",
+        default=False
+    )
+
+    bpy.types.Scene.ta_uv_flip_v = bpy.props.BoolProperty(
+        name="Flip V",
+        default=False
+    )
+
 def unregister():
+    del bpy.types.Scene.ta_uv_flip_v
+    del bpy.types.Scene.ta_uv_flip_u
+    del bpy.types.Scene.ta_uv_rotation
+    del bpy.types.Scene.ta_uv_padding
+    del bpy.types.Scene.ta_uv_preserve_aspect
+    del bpy.types.Scene.ta_uv_fit_mode
+    del bpy.types.Scene.ta_uv_projection_space
+    del bpy.types.Scene.ta_uv_projection_mode
+    del bpy.types.Scene.ta_uv_map_name
     del bpy.types.Scene.ta_validation_message
     del bpy.types.Scene.ee_export_path
+    del bpy.types.Scene.ee_budget_cached_state
+    del bpy.types.Scene.ee_budget_cached_signature
+    del bpy.types.Scene.ee_budget_cached_mode
+    del bpy.types.Scene.ee_budget_cached_count
+    del bpy.types.Scene.ee_budget_cached_valid
     del bpy.types.Scene.ee_hp_prefix
     del bpy.types.Scene.ee_lp_prefix
     del bpy.types.Scene.ee_auto_poly_prefix
@@ -912,6 +1511,8 @@ def unregister():
     bpy.utils.unregister_class(TA_PT_rename_tool_panel)
     bpy.utils.unregister_class(TA_PT_tools_panel)
 
+    bpy.utils.unregister_class(TA_OT_planar_project_selected_uv)
+    bpy.utils.unregister_class(TA_OT_calculate_budget)
     bpy.utils.unregister_class(TA_OT_check_non_manifold)
     bpy.utils.unregister_class(TA_OT_unify)
     bpy.utils.unregister_class(TA_OT_move_origin)
