@@ -3,20 +3,32 @@
 JAM TA Tools for Autodesk Maya
 Author: Juan Abia Merino
 
+A single-file toolkit for game-art workflows in Maya: batch renaming,
+poly-budget tracking with engine-vertex estimation, pivot placement,
+mesh and UV validation (non-manifold geometry, lamina faces, scale
+issues, missing/flipped/out-of-range UVs), texel density checking and
+matching, validated FBX export (single file or batch with move-to-origin)
+and rigging helpers (IK handle + pole vector placement, pose-driven
+muscle joints). Settings persist between sessions and batch operations
+are grouped into single undo steps.
+
 Install/Run:
-    1. Save this file where Maya can accesss.
-    2. In Maya's Python tab (Script Editor):
+    1. Save this file somewhere Maya can access
+       (e.g. your Documents/maya/scripts folder).
+    2. In Maya's Script Editor (Python tab):
 
         import sys
-        sys.path.append(r"path to the file")
+        sys.path.append(r"path/to/folder/containing/this/file")
         import ta_tools as jamta
-        jamta.show()    
+        jamta.show()
 """
 
 from __future__ import annotations
 
+import math
 import os
 import re
+from functools import wraps
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
@@ -24,7 +36,7 @@ try:
     import maya.mel as mel
     import maya.api.OpenMaya as om
 except Exception:
-    #Allow syntax checkin outside Maya
+    # Allow syntax checking / linting outside Maya
     cmds = None
     mel = None
     om = None
@@ -41,19 +53,24 @@ COUNT_MODES = ["Estimated Game Verts", "Tris", "Faces", "Verts"]
 # General Helpers
 # ---
 
+
 def _require_maya() -> None:
     if cmds is None or mel is None or om is None:
         raise RuntimeError("This tool must be run inside Autodesk Maya")
 
+
 def _long_name(node: str) -> str:
-    result = cmds.ls(node, long = True) or []
+    result = cmds.ls(node, long=True) or []
     return result[0] if result else node
+
 
 def _short_name(node: str) -> str:
     return node.split("|")[-1]
 
+
 def _strip_namespace(name: str) -> str:
     return name.split(":")[-1]
+
 
 def _unique_preserve_order(items: Iterable[str]) -> List[str]:
     seen = set()
@@ -66,36 +83,72 @@ def _unique_preserve_order(items: Iterable[str]) -> List[str]:
 
     return out
 
-def _flatten(value):
-    if value is None:
-        return[]
-    
-    if isinstance(value, (list, tuple)):
-        out = []
-        for item in value:
-            out.extend(_flatten(item))
-        return out
-    
-    return [value]
 
 def _round_tuple(values: Sequence[float], precision: int = 6) -> Tuple[float, ...]:
     return tuple(round(float(v), precision) for v in values)
+
 
 def _safe_int(value, default: int = 0) -> int:
     try:
         return int(value)
     except Exception:
         return default
-    
+
+
 def _status(message: str, warning: bool = False) -> None:
     if warning:
         cmds.warning(message)
     else:
         print("JAM TA Tools: " + message)
 
+
+def undoable(func):
+    """
+    Wrap an operation in a single undo chunk so a whole batch
+    (e.g. renaming 50 objects) undoes with one Ctrl+Z.
+    """
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if cmds is None:
+            return func(*args, **kwargs)
+
+        cmds.undoInfo(openChunk=True, chunkName=func.__name__)
+
+        try:
+            return func(*args, **kwargs)
+        finally:
+            cmds.undoInfo(closeChunk=True)
+
+    return wrapper
+
+
+# ---
+# Settings persistence (optionVar)
+# ---
+
+_OPTIONVAR_PREFIX = "JAMTATools_"
+
+
+def _save_option(name: str, value) -> None:
+    if cmds is None:
+        return
+
+    cmds.optionVar(stringValue=(_OPTIONVAR_PREFIX + name, str(value)))
+
+
+def _load_option(name: str, default: str = "") -> str:
+    full_name = _OPTIONVAR_PREFIX + name
+
+    if cmds is not None and cmds.optionVar(exists=full_name):
+        return str(cmds.optionVar(query=full_name))
+
+    return default
+
 # ---
 # Mesh selection and geometry helpers
 # ---
+
 
 def get_mesh_shapes(transform: str, no_intermediate: bool = True) -> List[str]:
     """
@@ -106,14 +159,14 @@ def get_mesh_shapes(transform: str, no_intermediate: bool = True) -> List[str]:
 
     shapes = cmds.listRelatives(
         transform,
-        shapes = True,
-        fullPath = True,
-        type = "mesh",
+        shapes=True,
+        fullPath=True,
+        type="mesh",
     ) or []
 
     if not no_intermediate:
         return shapes
-    
+
     out = []
 
     for shape in shapes:
@@ -125,6 +178,7 @@ def get_mesh_shapes(transform: str, no_intermediate: bool = True) -> List[str]:
 
     return out
 
+
 def node_to_mesh_transform(node: str) -> Optional[str]:
     """
     Return the transform if node is/contains a visible mesh shape
@@ -132,32 +186,33 @@ def node_to_mesh_transform(node: str) -> Optional[str]:
 
     if not cmds.objExists(node):
         return None
-    
+
     node_type = cmds.nodeType(node)
 
     if node_type == "mesh":
-        parents = cmds.listRelatives(node, parent = True, fullPath = True) or []
+        parents = cmds.listRelatives(node, parent=True, fullPath=True) or []
         return parents[0] if parents else None
-    
+
     if node_type == "transform" and get_mesh_shapes(node):
         return _long_name(node)
-    
+
     return None
+
 
 def get_selected_mesh_transforms() -> List[str]:
     """
     Return selected transforms that contain non-intermediate mesh shapes
     """
 
-    selection = cmds.ls(selection=True, long = True) or []
+    selection = cmds.ls(selection=True, long=True) or []
 
     # If components are selected, try to resolve them back to owning objects
     if selection:
         converted = (
             cmds.ls(
                 cmds.polyListComponentConversion(selection, toVertex=True),
-                objectsOnly = True,
-                long = True
+                objectsOnly=True,
+                long=True
             )
             or []
         )
@@ -173,19 +228,21 @@ def get_selected_mesh_transforms() -> List[str]:
 
     return _unique_preserve_order(transforms)
 
+
 def get_active_mesh_transform() -> Optional[str]:
-    selection = cmds.ls(selection=True, long = True) or []
+    selection = cmds.ls(selection=True, long=True) or []
 
     if not selection:
         return None
-    
+
     for node in selection:
         transform = node_to_mesh_transform(node)
 
         if transform:
             return transform
-        
+
     return None
+
 
 def get_world_bbox(obj: str) -> Optional[Tuple[float, float, float,
                                                 float, float, float]]:
@@ -194,23 +251,25 @@ def get_world_bbox(obj: str) -> Optional[Tuple[float, float, float,
     """
 
     try:
-        bbox = cmds.xform(obj, query = True, worldSpace = True, boundingBox = True)
+        bbox = cmds.xform(obj, query=True, worldSpace=True, boundingBox=True)
     except Exception:
         return None
-    
+
     if not bbox or len(bbox) != 6:
         return None
-    
+
     return tuple(float(v) for v in bbox)
 
-def combine_bboxes(bboxes: Iterable[Sequence[float]],) -> Optional[Tuple[float,float,float,
-                                                                         float,float,float]]:
+
+def combine_bboxes(
+        bboxes: Iterable[Sequence[float]],
+) -> Optional[Tuple[float, float, float, float, float, float]]:
     bboxes = [b for b in bboxes if b and len(b) == 6]
 
     if not bboxes:
         return None
-    
-    return(
+
+    return (
         min(b[0] for b in bboxes),
         min(b[1] for b in bboxes),
         min(b[2] for b in bboxes),
@@ -219,6 +278,7 @@ def combine_bboxes(bboxes: Iterable[Sequence[float]],) -> Optional[Tuple[float,f
         max(b[5] for b in bboxes),
     )
 
+
 def bbox_axis_value(bbox: Sequence[float], axis_index: int, mode: str) -> float:
     """
     Resolve one axis value from bbox using Maya/World axes
@@ -226,22 +286,24 @@ def bbox_axis_value(bbox: Sequence[float], axis_index: int, mode: str) -> float:
 
     if mode == "Mid":
         return (float(bbox[axis_index]) + float(bbox[axis_index + 3])) * 0.5
-    
+
     # Positive = max, negative = min
     if mode.startswith("-"):
         return float(bbox[axis_index])
-    
+
     return float(bbox[axis_index + 3])
+
 
 def current_pivot(obj: str) -> Tuple[float, float, float]:
     pivot = cmds.xform(
         obj,
-        query = True,
-        worldSpace = True,
-        rotatePivot = True,
+        query=True,
+        worldSpace=True,
+        rotatePivot=True,
     )
 
-    return float(pivot[0]), float(pivot[1]), float(pivot[2]) 
+    return float(pivot[0]), float(pivot[1]), float(pivot[2])
+
 
 def set_pivot_world(obj: str, pivot: Sequence[float]) -> None:
     """
@@ -250,15 +312,17 @@ def set_pivot_world(obj: str, pivot: Sequence[float]) -> None:
 
     cmds.xform(
         obj,
-        worldSpace = True,
-        rotatePivot = pivot,
-        scalePivot = pivot,
+        worldSpace=True,
+        rotatePivot=pivot,
+        scalePivot=pivot,
     )
 
 # ---
 # RENAME
 # ---
 
+
+@undoable
 def rename_selected(
         prefix: str,
         item_name: str,
@@ -269,12 +333,22 @@ def rename_selected(
 
     if not meshes:
         raise RuntimeError("No mesh transforms selected")
-    
+
+    # Track objects by UUID: renaming a parent transform invalidates the
+    # stored DAG paths of any selected children, so paths captured up front
+    # can go stale mid-loop. UUIDs survive renames.
+    uuids = [cmds.ls(obj, uuid=True)[0] for obj in meshes]
+
     renamed = []
     width = max(2, len(str(start_index + len(meshes) - 1)))
 
-    for offset, obj in enumerate(meshes):
+    for offset, uuid in enumerate(uuids):
         index = start_index + offset
+
+        current_paths = cmds.ls(uuid, long=True) or []
+        if not current_paths:
+            continue
+        obj = current_paths[0]
 
         new_name = "{0}_{1}_{2:0{3}d}".format(
             prefix,
@@ -305,11 +379,13 @@ def rename_selected(
 # Budget / metric counting
 # ---
 
+
 def _get_dag_path(shape: str):
     sel = om.MSelectionList()
     sel.add(shape)
 
     return sel.getDagPath(0)
+
 
 def get_shape_metric(
         shape: str,
@@ -318,17 +394,18 @@ def get_shape_metric(
 ) -> int:
     if mode == "Verts":
         return _safe_int(cmds.polyEvaluate(shape, vertex=True), 0)
-    
+
     if mode == "Faces":
         return _safe_int(cmds.polyEvaluate(shape, face=True), 0)
-    
+
     if mode == "Tris":
         return _safe_int(cmds.polyEvaluate(shape, triangle=True), 0)
-    
+
     return estimate_game_vertices(
         shape,
         count_material_splits=count_material_splits,
     )
+
 
 def get_mesh_metric(
         obj: str,
@@ -343,8 +420,9 @@ def get_mesh_metric(
             mode,
             count_material_splits=count_material_splits,
         )
-    
+
     return total
+
 
 def get_selection_metric(
         mode: str,
@@ -359,6 +437,7 @@ def get_selection_metric(
         for obj in get_selected_mesh_transforms()
     )
 
+
 def estimate_game_vertices(
         shape: str,
         count_material_splits: bool = True,
@@ -370,8 +449,9 @@ def estimate_game_vertices(
         vertex id + face-vertex normal + every UV set + optional shader/material index
 
     REMINDER:
-    This is an estimate. The final vertex count depends on engine importer, tangent generation, compression,
-    lightmap UVs, skinning data, export settings, ... but it's a pretty good approach.
+    This is an estimate. The final vertex count depends on the engine importer,
+    tangent generation, compression, lightmap UVs, skinning data, export
+    settings, etc. -- but it is a close approximation for budget tracking.
     """
 
     dag = _get_dag_path(shape)
@@ -387,7 +467,7 @@ def estimate_game_vertices(
     shader_indices = []
     if count_material_splits:
         try:
-            _shaders, shader_indices = mesh_fn.getConnectedShaders(dag.instanceNumber(),)
+            _shaders, shader_indices = mesh_fn.getConnectedShaders(dag.instanceNumber())
         except Exception:
             shader_indices = []
 
@@ -428,6 +508,7 @@ def estimate_game_vertices(
 
     return len(unique_keys)
 
+
 def classify_budget(
         count: int,
         budget: int,
@@ -448,7 +529,7 @@ def classify_budget(
             "label": "High",
             "limit": high_limit,
         }
-    
+
     if count >= warning_start:
         return {
             "prefix": lp_prefix,
@@ -456,13 +537,14 @@ def classify_budget(
             "label": "Near budget",
             "limit": high_limit,
         }
-    
+
     return {
-            "prefix": lp_prefix,
-            "state": "LOW",
-            "label": "Low",
-            "limit": high_limit,
-        }
+        "prefix": lp_prefix,
+        "state": "LOW",
+        "label": "Low",
+        "limit": high_limit,
+    }
+
 
 def remove_existing_poly_prefix(
         name: str,
@@ -481,6 +563,7 @@ def remove_existing_poly_prefix(
 
     return clean
 
+
 def export_name_with_prefix(
         base_name: str,
         count: int,
@@ -489,7 +572,9 @@ def export_name_with_prefix(
         lp_prefix: str,
         hp_prefix: str,
 ):
-    classification = classify_budget(count, budget, margin_percent, lp_prefix, hp_prefix,)
+    classification = classify_budget(
+        count, budget, margin_percent, lp_prefix, hp_prefix,
+    )
 
     clean_name = remove_existing_poly_prefix(
         _strip_namespace(_short_name(base_name)),
@@ -502,6 +587,8 @@ def export_name_with_prefix(
 # Pivot tool
 # ---
 
+
+@undoable
 def set_selected_pivots(
         x_axis: str = "None",
         y_axis: str = "None",
@@ -512,7 +599,7 @@ def set_selected_pivots(
 
     if not meshes:
         raise RuntimeError("No mesh transforms selected")
-    
+
     axis_settings = [
             (x_axis, 0),
             (y_axis, 1),
@@ -523,7 +610,7 @@ def set_selected_pivots(
 
     if not axis_settings:
         raise RuntimeError("No pivot axis selected")
-    
+
     moved = 0
 
     if individual:
@@ -548,7 +635,7 @@ def set_selected_pivots(
 
         if not shared_bbox:
             raise RuntimeError("Could not calculate selection bounding box")
-        
+
         shared_values = {}
 
         for mode, axis_index in axis_settings:
@@ -563,21 +650,24 @@ def set_selected_pivots(
                 pivot[axis_index] = value
 
             set_pivot_world(obj, pivot)
-            moved+=1
+            moved += 1
 
     return moved
 
+
+@undoable
 def move_pivot_to_selected_vertices() -> int:
     """
     Move each selected mesh object's pivot to its selected vertex position.
 
-    If multiple vertex are selected, the pivot is moved to the average world-position.
+    If multiple vertices are selected, the pivot is moved to their
+    average world position.
     """
 
     selected_vertices = cmds.ls(
-        selection = True,
-        flatten = True,
-        long = True,
+        selection=True,
+        flatten=True,
+        long=True,
     ) or []
 
     selected_vertices = [
@@ -586,7 +676,7 @@ def move_pivot_to_selected_vertices() -> int:
 
     if not selected_vertices:
         raise RuntimeError("No vertices selected")
-    
+
     vertices_by_object = {}
 
     for vertex in selected_vertices:
@@ -600,7 +690,7 @@ def move_pivot_to_selected_vertices() -> int:
 
     if not vertices_by_object:
         raise RuntimeError("Could not find a mesh object from the selected vertices")
-    
+
     moved_count = 0
 
     for obj, vertices in vertices_by_object.items():
@@ -608,7 +698,7 @@ def move_pivot_to_selected_vertices() -> int:
 
         for vertex in vertices:
             try:
-                point = cmds.pointPosition(vertex, world = True)
+                point = cmds.pointPosition(vertex, world=True)
                 points.append(point)
 
             except Exception:
@@ -632,12 +722,14 @@ def move_pivot_to_selected_vertices() -> int:
 # Validation -> Manifolds
 # ---
 
+
 _COMPONENT_RE = re.compile(r"[^\s#]+\.(?:e|vtx|f)\[[^\]]+\]")
+
 
 def _polyinfo_components(lines: Optional[Sequence[str]]) -> List[str]:
     if not lines:
         return []
-    
+
     components = []
 
     for line in lines:
@@ -645,7 +737,95 @@ def _polyinfo_components(lines: Optional[Sequence[str]]) -> List[str]:
 
     return components
 
-def check_mesh_validation(obj: str) -> Dict[str, object]:
+
+def _uv_signed_area(us: Sequence[float], vs: Sequence[float]) -> float:
+    """
+    Signed area of a UV polygon via the shoelace formula.
+    A negative value means the face's UV winding is flipped.
+    """
+
+    area = 0.0
+    count = len(us)
+
+    for i in range(count):
+        j = (i + 1) % count
+        area += us[i] * vs[j] - us[j] * vs[i]
+
+    return area * 0.5
+
+
+def check_shape_uvs(shape: str, tolerance: float = 0.001) -> Dict[str, object]:
+    """
+    UV checks for one mesh shape: missing UVs, UVs outside the 0-1
+    range, flipped faces and zero-area faces (in the default UV set).
+
+    Note: full UV overlap detection is intentionally out of scope here;
+    it needs spatial acceleration to stay usable on production meshes.
+    """
+
+    result = {
+        "missing_uvs": False,
+        "uvs_out_of_range": False,
+        "flipped_uv_faces": [],
+        "zero_uv_faces": [],
+    }
+
+    if _safe_int(cmds.polyEvaluate(shape, uvcoord=True), 0) == 0:
+        result["missing_uvs"] = True
+        return result
+
+    bbox2d = None
+
+    try:
+        bbox2d = cmds.polyEvaluate(shape, boundingBox2d=True)
+    except Exception:
+        bbox2d = None
+
+    if bbox2d and len(bbox2d) == 2:
+        (u_min, u_max), (v_min, v_max) = bbox2d
+
+        if (u_min < -tolerance or v_min < -tolerance
+                or u_max > 1.0 + tolerance or v_max > 1.0 + tolerance):
+            result["uvs_out_of_range"] = True
+
+    try:
+        dag = _get_dag_path(shape)
+        iterator = om.MItMeshPolygon(dag)
+    except Exception:
+        return result
+
+    flipped = []
+    zero_area = []
+
+    while not iterator.isDone():
+        face_index = iterator.index()
+
+        try:
+            if iterator.hasUVs():
+                us, vs = iterator.getUVs()
+                area = _uv_signed_area(us, vs)
+
+                if abs(area) < 1e-9:
+                    zero_area.append("{0}.f[{1}]".format(shape, face_index))
+                elif area < 0.0:
+                    flipped.append("{0}.f[{1}]".format(shape, face_index))
+            else:
+                result["missing_uvs"] = True
+        except Exception:
+            pass
+
+        iterator.next()
+
+    result["flipped_uv_faces"] = flipped
+    result["zero_uv_faces"] = zero_area
+
+    return result
+
+
+def check_mesh_validation(
+        obj: str,
+        include_uv_checks: bool = True,
+) -> Dict[str, object]:
     """
     Return validation data for one mesh transform
     """
@@ -673,13 +853,30 @@ def check_mesh_validation(obj: str) -> Dict[str, object]:
             cmds.polyInfo(obj, laminaFaces=True),
         )
     except Exception:
-        lamina_faces= []
+        lamina_faces = []
 
     # Transform-level checks for game export
-    scale = cmds.xform(obj, query=True, relative=True, scale=True,)
+    scale = cmds.xform(obj, query=True, relative=True, scale=True)
 
     negative_scale = any(float(v) < 0.0 for v in scale)
-    non_frozen_scale = any(abs(float(v) -1) > 0.0001 for v in scale)
+    non_frozen_scale = any(abs(float(v) - 1.0) > 0.0001 for v in scale)
+
+    # UV-level checks, aggregated across the object's shapes
+    missing_uvs = False
+    uvs_out_of_range = False
+    flipped_uv_faces = []
+    zero_uv_faces = []
+
+    if include_uv_checks:
+        for shape in get_mesh_shapes(obj):
+            uv_result = check_shape_uvs(shape)
+
+            missing_uvs = missing_uvs or bool(uv_result["missing_uvs"])
+            uvs_out_of_range = (
+                uvs_out_of_range or bool(uv_result["uvs_out_of_range"])
+            )
+            flipped_uv_faces.extend(uv_result["flipped_uv_faces"])
+            zero_uv_faces.extend(uv_result["zero_uv_faces"])
 
     return {
         "object": obj,
@@ -688,30 +885,44 @@ def check_mesh_validation(obj: str) -> Dict[str, object]:
         "lamina_faces": lamina_faces,
         "negative_scale": negative_scale,
         "non_frozen_scale": non_frozen_scale,
+        "missing_uvs": missing_uvs,
+        "uvs_out_of_range": uvs_out_of_range,
+        "flipped_uv_faces": flipped_uv_faces,
+        "zero_uv_faces": zero_uv_faces,
         "issue_count": (
             len(non_manifold_edges) + len(non_manifold_vertices) + len(lamina_faces)
             + int(negative_scale) + int(non_frozen_scale)
+            + int(missing_uvs) + int(uvs_out_of_range)
+            + len(flipped_uv_faces) + len(zero_uv_faces)
         ),
     }
 
+
 def validate_selection(
         select_first_issue: bool = True,
+        include_uv_checks: bool = True,
 ) -> Tuple[List[Dict[str, object]], str]:
     meshes = get_selected_mesh_transforms()
 
     if not meshes:
         raise RuntimeError("No mesh transforms selected")
-    
-    results = [check_mesh_validation(obj) for obj in meshes]
+
+    results = [
+        check_mesh_validation(obj, include_uv_checks=include_uv_checks)
+        for obj in meshes
+    ]
 
     problem_results = [r for r in results if int(r["issue_count"]) > 0]
 
     if not problem_results:
+        checked = "geometry and UV" if include_uv_checks else "geometry"
+
         return [], (
-            "Clean: no non-manifold edges, non-manifold vertices, lamina faces, "
-            "negative scale, or non-frozen scale found"
+            "Clean: no {0} issues found on {1} object(s)".format(
+                checked, len(meshes),
+            )
         )
-    
+
     lines = []
 
     for r in problem_results:
@@ -721,7 +932,7 @@ def validate_selection(
             flags.append(
                 "non-manifold edges: {0}".format(len(r["non_manifold_edges"]))
             )
-        
+
         if r["non_manifold_vertices"]:
             flags.append(
                 "non-manifold verts: {0}".format(len(r["non_manifold_vertices"]))
@@ -738,8 +949,24 @@ def validate_selection(
         if r["non_frozen_scale"]:
             flags.append("non-frozen scale")
 
+        if r.get("missing_uvs"):
+            flags.append("missing UVs")
+
+        if r.get("uvs_out_of_range"):
+            flags.append("UVs outside 0-1")
+
+        if r.get("flipped_uv_faces"):
+            flags.append(
+                "flipped UVs: {0}".format(len(r["flipped_uv_faces"]))
+            )
+
+        if r.get("zero_uv_faces"):
+            flags.append(
+                "zero-area UVs: {0}".format(len(r["zero_uv_faces"]))
+            )
+
         lines.append(
-            "{0}: {1}".format(_short_name(str(r["object"])), ", ".join(flags),)
+            "{0}: {1}".format(_short_name(str(r["object"])), ", ".join(flags))
         )
 
     if select_first_issue:
@@ -749,17 +976,19 @@ def validate_selection(
         components.extend(first["non_manifold_edges"])
         components.extend(first["non_manifold_vertices"])
         components.extend(first["lamina_faces"])
+        components.extend(first.get("flipped_uv_faces", []))
+        components.extend(first.get("zero_uv_faces", []))
 
         if components:
-            cmds.select(components, replace = True)
+            cmds.select(components, replace=True)
 
             try:
-                cmds.selectMode(component = True)
+                cmds.selectMode(component=True)
             except Exception:
                 pass
 
         else:
-            cmds.select(first["object"], replace = True)
+            cmds.select(first["object"], replace=True)
 
     return problem_results, " | ".join(lines)
 
@@ -767,55 +996,64 @@ def validate_selection(
 # Combine / export
 # ---
 
+
+@undoable
 def combine_selected_meshes() -> Optional[str]:
     meshes = get_selected_mesh_transforms()
 
     if len(meshes) < 2:
         raise RuntimeError("Select at least two mesh transforms to combine")
-    
+
     result = cmds.polyUnite(
-        meshes, constructionHistory = False, mergeUVSets = True,
+        meshes, constructionHistory=False, mergeUVSets=True,
     )
 
     if not result:
         return None
-    
+
     combined = result[0]
 
     cmds.delete(combined, constructionHistory=True)
-    cmds.select(combined, replace = True)
+    cmds.select(combined, replace=True)
 
     return _long_name(combined)
+
 
 def _ensure_fbx_plugin() -> None:
     if not cmds.pluginInfo("fbxmaya", query=True, loaded=True):
         cmds.loadPlugin("fbxmaya")
 
+
 def _mel_string(path: str) -> str:
     return path.replace("\\", "/").replace('"', '\\"')
+
 
 def export_selected_fbx(
         export_folder: str,
         export_name: str,
         validate_before_export: bool = True,
         block_on_validation_errors: bool = True,
+        include_uv_checks: bool = True,
 ) -> str:
     meshes = get_selected_mesh_transforms()
 
     if not meshes:
         raise RuntimeError("No mesh transforms selected for export")
-    
+
     export_folder = os.path.abspath(os.path.expanduser(export_folder))
 
     if not os.path.isdir(export_folder):
         raise RuntimeError("Invalid export folder: {0}".format(export_folder))
-    
+
     if validate_before_export:
-        problems, message = validate_selection(select_first_issue=False)
+        problems, message = validate_selection(
+            select_first_issue=False,
+            include_uv_checks=include_uv_checks,
+        )
 
         if problems and block_on_validation_errors:
             raise RuntimeError("Export blocked by validation: {0}".format(message))
-        
+
     _ensure_fbx_plugin()
 
     filepath = os.path.join(export_folder, export_name + ".fbx")
@@ -852,9 +1090,437 @@ def export_selected_fbx(
 
     return filepath
 
+
+def export_object_fbx(
+        obj: str,
+        export_folder: str,
+        export_name: str,
+        move_to_origin: bool = True,
+        validate_before_export: bool = True,
+        block_on_validation_errors: bool = True,
+        include_uv_checks: bool = True,
+) -> str:
+    """
+    Export a single object to its own FBX file, optionally moving its
+    pivot to the world origin for the export and restoring the original
+    position afterwards (the standard game-art batch export workflow).
+    """
+
+    original_selection = cmds.ls(selection=True, long=True) or []
+
+    cmds.select(obj, replace=True)
+
+    original_translation = None
+
+    try:
+        if move_to_origin:
+            pivot = cmds.xform(
+                obj, query=True, worldSpace=True, rotatePivot=True,
+            )
+            original_translation = cmds.xform(
+                obj, query=True, worldSpace=True, translation=True,
+            )
+
+            cmds.xform(
+                obj,
+                worldSpace=True,
+                translation=(
+                    original_translation[0] - pivot[0],
+                    original_translation[1] - pivot[1],
+                    original_translation[2] - pivot[2],
+                ),
+            )
+
+        return export_selected_fbx(
+            export_folder,
+            export_name,
+            validate_before_export=validate_before_export,
+            block_on_validation_errors=block_on_validation_errors,
+            include_uv_checks=include_uv_checks,
+        )
+
+    finally:
+        if move_to_origin and original_translation is not None:
+            cmds.xform(
+                obj, worldSpace=True, translation=original_translation,
+            )
+
+        if original_selection:
+            try:
+                cmds.select(original_selection, replace=True)
+            except Exception:
+                pass
+
+
+# ---
+# Texel density
+# ---
+
+def _object_area_totals(obj: str) -> Tuple[float, float]:
+    """
+    Total world-space surface area and UV area across an object's
+    mesh shapes (default UV set).
+    """
+
+    total_world = 0.0
+    total_uv = 0.0
+
+    for shape in get_mesh_shapes(obj):
+        try:
+            dag = _get_dag_path(shape)
+            iterator = om.MItMeshPolygon(dag)
+        except Exception:
+            continue
+
+        while not iterator.isDone():
+            try:
+                total_world += iterator.getArea(om.MSpace.kWorld)
+
+                if iterator.hasUVs():
+                    us, vs = iterator.getUVs()
+                    total_uv += abs(_uv_signed_area(us, vs))
+            except Exception:
+                pass
+
+            iterator.next()
+
+    return total_world, total_uv
+
+
+def get_object_texel_density(obj: str, texture_size: int) -> Optional[float]:
+    """
+    Average texel density of an object in pixels per world unit:
+
+        density = texture_size * sqrt(uv_area / world_area)
+    """
+
+    world_area, uv_area = _object_area_totals(obj)
+
+    if world_area <= 0.0 or uv_area <= 0.0:
+        return None
+
+    return float(texture_size) * math.sqrt(uv_area / world_area)
+
+
+def get_selection_texel_density(texture_size: int) -> Optional[float]:
+    """
+    Area-weighted average texel density across the current selection.
+    """
+
+    total_world = 0.0
+    total_uv = 0.0
+
+    for obj in get_selected_mesh_transforms():
+        world_area, uv_area = _object_area_totals(obj)
+        total_world += world_area
+        total_uv += uv_area
+
+    if total_world <= 0.0 or total_uv <= 0.0:
+        return None
+
+    return float(texture_size) * math.sqrt(total_uv / total_world)
+
+
+@undoable
+def set_selection_texel_density(
+        target_density: float,
+        texture_size: int,
+) -> int:
+    """
+    Uniformly scale each selected object's UVs (around their UV
+    bounding-box center) so its texel density matches the target.
+    """
+
+    meshes = get_selected_mesh_transforms()
+
+    if not meshes:
+        raise RuntimeError("No mesh transforms selected")
+
+    if target_density <= 0.0:
+        raise RuntimeError("Target texel density must be greater than zero")
+
+    adjusted = 0
+
+    for obj in meshes:
+        current = get_object_texel_density(obj, texture_size)
+
+        if not current or current <= 0.0:
+            _status(
+                "Skipped {0}: no UV or surface area".format(_short_name(obj)),
+                warning=True,
+            )
+            continue
+
+        factor = float(target_density) / current
+
+        if abs(factor - 1.0) < 0.0001:
+            continue
+
+        for shape in get_mesh_shapes(obj):
+            try:
+                bbox2d = cmds.polyEvaluate(shape, boundingBox2d=True)
+                (u_min, u_max), (v_min, v_max) = bbox2d
+            except Exception:
+                continue
+
+            cmds.polyEditUV(
+                shape + ".map[*]",
+                pivotU=(u_min + u_max) * 0.5,
+                pivotV=(v_min + v_max) * 0.5,
+                scaleU=factor,
+                scaleV=factor,
+            )
+
+        adjusted += 1
+
+    return adjusted
+
+
+# ---
+# Rigging helpers
+# ---
+
+@undoable
+def create_ik_with_pole_vector(pole_distance: float = 1.0) -> Tuple[str, str]:
+    """
+    Create an RP-solver IK handle between the first and last selected
+    joints, with a pole vector locator placed on the chain's bend plane.
+
+    Placement math: the middle joint is projected onto the start->end
+    axis; the rejection vector (mid - projection) points away from the
+    chain on its bend plane, which is exactly where the pole vector
+    belongs to preserve the current bend direction.
+    """
+
+    joints = cmds.ls(selection=True, type="joint", long=True) or []
+
+    if len(joints) < 2:
+        raise RuntimeError(
+            "Select the start joint and the end joint of the chain"
+        )
+
+    start = joints[0]
+    end = joints[-1]
+
+    # Walk up from the end joint to confirm it descends from the start
+    chain = [end]
+    current = end
+
+    while True:
+        parents = cmds.listRelatives(
+            current, parent=True, fullPath=True, type="joint",
+        ) or []
+
+        if not parents:
+            break
+
+        current = parents[0]
+        chain.append(current)
+
+        if current == start:
+            break
+
+    if chain[-1] != start:
+        raise RuntimeError(
+            "The last selected joint must be a descendant of the first"
+        )
+
+    chain.reverse()  # start -> end
+
+    if len(chain) < 3:
+        raise RuntimeError(
+            "The chain needs at least one middle joint for a pole vector"
+        )
+
+    positions = [
+        om.MVector(
+            *cmds.xform(j, query=True, worldSpace=True, rotatePivot=True)
+        )
+        for j in chain
+    ]
+
+    start_pos = positions[0]
+    end_pos = positions[-1]
+    mid_pos = positions[len(positions) // 2]
+
+    axis = end_pos - start_pos
+    to_mid = mid_pos - start_pos
+
+    if axis.length() < 1e-6:
+        raise RuntimeError("Start and end joints are at the same position")
+
+    axis_normal = axis.normal()
+
+    # Vector rejection: component of to_mid perpendicular to the chain axis
+    projection = axis_normal * (to_mid * axis_normal)
+    pole_direction = to_mid - projection
+
+    chain_length = sum(
+        (positions[i + 1] - positions[i]).length()
+        for i in range(len(positions) - 1)
+    )
+
+    if pole_direction.length() < 1e-6:
+        # Perfectly straight chain: any perpendicular works, so warn
+        fallback = om.MVector(0.0, 0.0, 1.0)
+
+        if abs(axis_normal * fallback) > 0.999:
+            fallback = om.MVector(0.0, 1.0, 0.0)
+
+        pole_direction = axis_normal ^ fallback
+
+        _status(
+            "Chain is straight; pole vector direction is arbitrary",
+            warning=True,
+        )
+
+    pole_position = (
+        mid_pos
+        + pole_direction.normal() * (chain_length * 0.5 * float(pole_distance))
+    )
+
+    base_name = _strip_namespace(_short_name(chain[0]))
+
+    handle, _effector = cmds.ikHandle(
+        startJoint=chain[0],
+        endEffector=chain[-1],
+        solver="ikRPsolver",
+        name="IK_{0}".format(base_name),
+    )
+
+    locator = cmds.spaceLocator(name="PV_{0}".format(base_name))[0]
+
+    cmds.xform(
+        locator,
+        worldSpace=True,
+        translation=(pole_position.x, pole_position.y, pole_position.z),
+    )
+
+    cmds.poleVectorConstraint(locator, handle)
+    cmds.select(handle, replace=True)
+
+    return handle, locator
+
+
+@undoable
+def create_muscle_helper(
+        rotate_axis: str = "Z",
+        max_angle: float = 90.0,
+        bulge_scale: float = 1.4,
+) -> str:
+    """
+    Create a pose-driven 'muscle' joint between two selected joints --
+    the classic bicep setup.
+
+    Select the upper joint (e.g. shoulder), then the bend joint
+    (e.g. elbow). A helper joint is parented under the upper joint at
+    the muscle position, and set-driven keys make it bulge as the bend
+    joint rotates. Keys are set at both +max_angle and -max_angle so
+    the rig's bend direction does not matter.
+
+    Assumes the bend joint's rotation is zero in the rest pose. To see
+    the bulge on a mesh, add the helper joint to the skinCluster and
+    paint its weights over the muscle area.
+    """
+
+    joints = cmds.ls(selection=True, type="joint", long=True) or []
+
+    if len(joints) != 2:
+        raise RuntimeError(
+            "Select exactly two joints: the upper joint, then the bend joint"
+        )
+
+    upper, bend = joints
+    axis = str(rotate_axis).upper()
+
+    if axis not in ("X", "Y", "Z"):
+        raise RuntimeError("Rotate axis must be X, Y or Z")
+
+    upper_pos = om.MVector(
+        *cmds.xform(upper, query=True, worldSpace=True, rotatePivot=True)
+    )
+    bend_pos = om.MVector(
+        *cmds.xform(bend, query=True, worldSpace=True, rotatePivot=True)
+    )
+
+    muscle_pos = (upper_pos + bend_pos) * 0.5
+
+    base_name = _strip_namespace(_short_name(upper))
+
+    cmds.select(clear=True)
+
+    helper = cmds.joint(name="MUSCLE_{0}".format(base_name))
+    helper = cmds.parent(helper, upper)[0]
+    helper = _long_name(helper)
+
+    cmds.xform(
+        helper,
+        worldSpace=True,
+        translation=(muscle_pos.x, muscle_pos.y, muscle_pos.z),
+    )
+
+    driver_attribute = "{0}.rotate{1}".format(bend, axis)
+
+    for scale_axis in ("X", "Y", "Z"):
+        driven_attribute = "{0}.scale{1}".format(helper, scale_axis)
+
+        cmds.setDrivenKeyframe(
+            driven_attribute,
+            currentDriver=driver_attribute,
+            driverValue=0.0,
+            value=1.0,
+        )
+        cmds.setDrivenKeyframe(
+            driven_attribute,
+            currentDriver=driver_attribute,
+            driverValue=float(max_angle),
+            value=float(bulge_scale),
+        )
+        cmds.setDrivenKeyframe(
+            driven_attribute,
+            currentDriver=driver_attribute,
+            driverValue=-float(max_angle),
+            value=float(bulge_scale),
+        )
+
+    cmds.select(helper, replace=True)
+
+    return helper
+
+
 # ---
 # UI
 # ---
+
+
+# Controls whose values persist between Maya sessions via optionVar.
+# "allow_combine" is deliberately excluded: destructive toggles should
+# always reset to off.
+_PERSISTED_CONTROLS = (
+    ("rs_prefix", "textFieldGrp", "text"),
+    ("rs_name", "textFieldGrp", "text"),
+    ("budget_mode", "optionMenuGrp", "value"),
+    ("budget", "intFieldGrp", "value1"),
+    ("margin", "floatFieldGrp", "value1"),
+    ("mat_splits", "checkBox", "value"),
+    ("auto_prefix", "checkBox", "value"),
+    ("lp_prefix", "textFieldGrp", "text"),
+    ("hp_prefix", "textFieldGrp", "text"),
+    ("select_issue", "checkBox", "value"),
+    ("uv_checks", "checkBox", "value"),
+    ("export_path", "textFieldButtonGrp", "text"),
+    ("validate_export", "checkBox", "value"),
+    ("block_export", "checkBox", "value"),
+    ("batch_mode", "checkBox", "value"),
+    ("move_origin", "checkBox", "value"),
+    ("td_size", "intFieldGrp", "value1"),
+    ("td_target", "floatFieldGrp", "value1"),
+    ("pole_mult", "floatFieldGrp", "value1"),
+    ("muscle_axis", "optionMenuGrp", "value"),
+    ("muscle_angle", "floatFieldGrp", "value1"),
+    ("muscle_bulge", "floatFieldGrp", "value1"),
+)
+
 
 class JAMTAToolsUI(object):
     def __init__(self):
@@ -869,28 +1535,44 @@ class JAMTAToolsUI(object):
 
         window = cmds.window(
             WINDOW_NAME,
-            title = WINDOW_TITLE,
-            sizeable = True,
-            widthHeight=(420, 669),
+            title=WINDOW_TITLE,
+            sizeable=True,
+            widthHeight=(430, 780),
         )
 
-        root = cmds.columnLayout(adjustableColumn=True, rowSpacing=8,)
+        scroll = cmds.scrollLayout(childResizable=True)
+
+        root = cmds.columnLayout(
+            adjustableColumn=True,
+            rowSpacing=8,
+            parent=scroll,
+        )
 
         cmds.text(
-            label = "JAM TA Tools",
-            align = "center",
-            height = 28,
-            font = "boldLabelFont",
+            label="JAM TA Tools",
+            align="center",
+            height=28,
+            font="boldLabelFont",
         )
 
-        cmds.separator(style = "in")
+        cmds.separator(style="in")
 
         self._build_rename_section(root)
         self._build_budget_section(root)
         self._build_pivot_section(root)
         self._build_validation_section(root)
         self._build_export_section(root)
+        self._build_texel_density_section(root)
+        self._build_rigging_section(root)
         self._build_status_section(root)
+
+        self._apply_saved_settings()
+
+        # Save settings when the window is closed
+        cmds.scriptJob(
+            uiDeleted=[WINDOW_NAME, self.save_settings],
+            runOnce=True,
+        )
 
         cmds.showWindow(window)
 
@@ -900,50 +1582,50 @@ class JAMTAToolsUI(object):
 
     def _build_rename_section(self, parent: str) -> None:
         frame = cmds.frameLayout(
-            label = "Rename Objects",
-            collapsable = True,
-            collapse = False,
-            marginWidth = 8,
-            marginHeight = 8,
-            parent = parent,
+            label="Rename Objects",
+            collapsable=True,
+            collapse=False,
+            marginWidth=8,
+            marginHeight=8,
+            parent=parent,
         )
 
         col = cmds.columnLayout(
-            adjustableColumn = True,
-            rowSpacing = 4,
-            parent = frame,
+            adjustableColumn=True,
+            rowSpacing=4,
+            parent=frame,
         )
 
         self.controls["rs_prefix"] = cmds.textFieldGrp(
-            label = "Prefix",
-            text = "SM",
-            columnWidth = [(1, 90), (2, 280),],
-            parent = col,
+            label="Prefix",
+            text="SM",
+            columnWidth=[(1, 90), (2, 280),],
+            parent=col,
         )
 
         self.controls["rs_name"] = cmds.textFieldGrp(
-            label = "Item name",
-            text = "Prop",
-            columnWidth = [(1, 90), (2, 280),],
-            parent = col,
+            label="Item name",
+            text="Prop",
+            columnWidth=[(1, 90), (2, 280),],
+            parent=col,
         )
 
         self.controls["rs_start"] = cmds.intFieldGrp(
-            label = "Start index",
-            value1 = 1,
-            columnWidth = [(1, 90), (2, 80),],
-            parent = col,
+            label="Start index",
+            value1=1,
+            columnWidth=[(1, 90), (2, 80),],
+            parent=col,
         )
 
         self.controls["rs_shapes"] = cmds.checkBox(
-            label = "Rename shape nodes too?",
-            value = True,
-            parent = col,
+            label="Rename shape nodes too?",
+            value=True,
+            parent=col,
         )
 
         cmds.button(
             label="Rename Selected",
-            command = lambda *_: self.on_rename_selected(),
+            command=lambda *_: self.on_rename_selected(),
             parent=col,
         )
 
@@ -1115,8 +1797,8 @@ class JAMTAToolsUI(object):
 
         cmds.button(
             label="Move Pivot to Selected Vertex",
-            command = lambda *_: self.on_pivot_to_selected_vertex(),
-            parent = col
+            command=lambda *_: self.on_pivot_to_selected_vertex(),
+            parent=col
         )
 
     def _axis_menu(self, label: str, items: List[str], parent: str) -> str:
@@ -1158,6 +1840,12 @@ class JAMTAToolsUI(object):
 
         self.controls["select_issue"] = cmds.checkBox(
             label="Select first issue",
+            value=True,
+            parent=col,
+        )
+
+        self.controls["uv_checks"] = cmds.checkBox(
+            label="Include UV checks (missing, 0-1 range, flipped)",
             value=True,
             parent=col,
         )
@@ -1232,6 +1920,18 @@ class JAMTAToolsUI(object):
             parent=col,
         )
 
+        self.controls["batch_mode"] = cmds.checkBox(
+            label="Batch: one FBX per selected object",
+            value=False,
+            parent=col,
+        )
+
+        self.controls["move_origin"] = cmds.checkBox(
+            label="Move to origin on export (batch only)",
+            value=True,
+            parent=col,
+        )
+
         cmds.button(
             label="Export Selected FBX",
             command=lambda *_: self.on_export(),
@@ -1248,6 +1948,151 @@ class JAMTAToolsUI(object):
             label="Ready.",
             align="left",
             parent=parent,
+        )
+
+    def _build_texel_density_section(self, parent: str) -> None:
+        frame = cmds.frameLayout(
+            label="Texel Density",
+            collapsable=True,
+            collapse=True,
+            marginWidth=8,
+            marginHeight=8,
+            parent=parent,
+        )
+
+        col = cmds.columnLayout(
+            adjustableColumn=True,
+            rowSpacing=4,
+            parent=frame,
+        )
+
+        cmds.text(
+            label="Density is measured in pixels per world unit.",
+            align="left",
+            parent=col,
+        )
+
+        self.controls["td_size"] = cmds.intFieldGrp(
+            label="Texture size",
+            value1=2048,
+            columnWidth=[(1, 90), (2, 100)],
+            parent=col,
+        )
+
+        self.controls["td_target"] = cmds.floatFieldGrp(
+            label="Target TD",
+            value1=10.24,
+            precision=3,
+            columnWidth=[(1, 90), (2, 100)],
+            parent=col,
+        )
+
+        row = cmds.rowLayout(
+            numberOfColumns=2,
+            adjustableColumn=2,
+            columnWidth2=(200, 200),
+            parent=col,
+        )
+
+        cmds.button(
+            label="Check Selection TD",
+            command=lambda *_: self.on_check_texel_density(),
+            parent=row,
+        )
+
+        cmds.button(
+            label="Set Selection TD",
+            command=lambda *_: self.on_set_texel_density(),
+            parent=row,
+        )
+
+        cmds.setParent(col)
+
+        self.controls["td_result"] = cmds.text(
+            label="",
+            align="left",
+            parent=col,
+        )
+
+    def _build_rigging_section(self, parent: str) -> None:
+        frame = cmds.frameLayout(
+            label="Rigging Helpers",
+            collapsable=True,
+            collapse=True,
+            marginWidth=8,
+            marginHeight=8,
+            parent=parent,
+        )
+
+        col = cmds.columnLayout(
+            adjustableColumn=True,
+            rowSpacing=4,
+            parent=frame,
+        )
+
+        cmds.text(
+            label="IK: select the start joint, then the end joint.",
+            align="left",
+            parent=col,
+        )
+
+        self.controls["pole_mult"] = cmds.floatFieldGrp(
+            label="Pole distance",
+            value1=1.0,
+            precision=2,
+            columnWidth=[(1, 90), (2, 100)],
+            parent=col,
+        )
+
+        cmds.button(
+            label="Create IK Handle + Pole Vector",
+            command=lambda *_: self.on_create_ik(),
+            parent=col,
+        )
+
+        cmds.separator(style="in", parent=col)
+
+        cmds.text(
+            label="Muscle: select the upper joint, then the bend joint.",
+            align="left",
+            parent=col,
+        )
+
+        self.controls["muscle_axis"] = cmds.optionMenuGrp(
+            label="Bend axis",
+            columnWidth=[(1, 90), (2, 100)],
+            parent=col,
+        )
+
+        for item in ("X", "Y", "Z"):
+            cmds.menuItem(label=item)
+
+        cmds.optionMenuGrp(
+            self.controls["muscle_axis"],
+            edit=True,
+            value="Z",
+        )
+
+        self.controls["muscle_angle"] = cmds.floatFieldGrp(
+            label="Max angle",
+            value1=90.0,
+            precision=1,
+            columnWidth=[(1, 90), (2, 100)],
+            parent=col,
+        )
+
+        self.controls["muscle_bulge"] = cmds.floatFieldGrp(
+            label="Bulge scale",
+            value1=1.4,
+            precision=2,
+            columnWidth=[(1, 90), (2, 100)],
+            parent=col,
+        )
+
+        cmds.button(
+            label="Create Muscle Helper Joint",
+            command=lambda *_: self.on_create_muscle(),
+            parent=col,
         )
 
     # --- UI Getters --
@@ -1315,6 +2160,54 @@ class JAMTAToolsUI(object):
             edit=True,
             label=message,
         )
+
+    # ---------------- Settings persistence ----------------
+
+    def save_settings(self) -> None:
+        for key, control_type, flag in _PERSISTED_CONTROLS:
+            control = self.controls.get(key)
+            command = getattr(cmds, control_type, None)
+
+            if not control or command is None:
+                continue
+
+            try:
+                if not command(control, exists=True):
+                    continue
+
+                value = command(control, query=True, **{flag: True})
+            except Exception:
+                continue
+
+            _save_option(key, value)
+
+    def _apply_saved_settings(self) -> None:
+        for key, control_type, flag in _PERSISTED_CONTROLS:
+            raw = _load_option(key, "")
+
+            if raw == "":
+                continue
+
+            control = self.controls.get(key)
+            command = getattr(cmds, control_type, None)
+
+            if not control or command is None:
+                continue
+
+            try:
+                if control_type == "checkBox":
+                    command(control, edit=True, value=raw in ("1", "True"))
+                elif control_type == "intFieldGrp":
+                    command(control, edit=True, value1=int(float(raw)))
+                elif control_type == "floatFieldGrp":
+                    command(control, edit=True, value1=float(raw))
+                else:
+                    # textFieldGrp / textFieldButtonGrp / optionMenuGrp;
+                    # optionMenuGrp raises if the saved value is no longer
+                    # a menu item, which the except silently absorbs
+                    command(control, edit=True, **{flag: raw})
+            except Exception:
+                pass
 
     # ---------------- UI callbacks ----------------
 
@@ -1483,8 +2376,15 @@ class JAMTAToolsUI(object):
                 value=True,
             )
 
+            include_uv = cmds.checkBox(
+                self.controls["uv_checks"],
+                query=True,
+                value=True,
+            )
+
             problems, message = validate_selection(
                 select_first_issue=select_first,
+                include_uv_checks=include_uv,
             )
 
             self.set_validation_message(message)
@@ -1559,69 +2459,80 @@ class JAMTAToolsUI(object):
             if not meshes:
                 raise RuntimeError("No mesh transforms selected.")
 
-            active = get_active_mesh_transform() or meshes[0]
-            base_name = _short_name(active)
-
             mode = self.get_count_mode()
+            count_splits = self.get_count_material_splits()
 
-            count = get_selection_metric(
-                mode,
-                count_material_splits=self.get_count_material_splits(),
+            auto_prefix = cmds.checkBox(
+                self.controls["auto_prefix"], query=True, value=True,
             )
-
-            if cmds.checkBox(
-                self.controls["auto_prefix"],
-                query=True,
-                value=True,
-            ):
-                export_name, classification = export_name_with_prefix(
-                    base_name,
-                    count,
-                    self.get_budget(),
-                    self.get_margin(),
-                    self.get_lp_prefix(),
-                    self.get_hp_prefix(),
-                )
-            else:
-                classification = None
-                export_name = _strip_namespace(base_name)
+            batch_mode = cmds.checkBox(
+                self.controls["batch_mode"], query=True, value=True,
+            )
+            move_origin = cmds.checkBox(
+                self.controls["move_origin"], query=True, value=True,
+            )
+            include_uv = cmds.checkBox(
+                self.controls["uv_checks"], query=True, value=True,
+            )
+            validate = cmds.checkBox(
+                self.controls["validate_export"], query=True, value=True,
+            )
+            block = cmds.checkBox(
+                self.controls["block_export"], query=True, value=True,
+            )
 
             export_folder = cmds.textFieldButtonGrp(
-                self.controls["export_path"],
-                query=True,
-                text=True,
+                self.controls["export_path"], query=True, text=True,
             )
 
-            filepath = export_selected_fbx(
-                export_folder,
-                export_name,
-                validate_before_export=cmds.checkBox(
-                    self.controls["validate_export"],
-                    query=True,
-                    value=True,
-                ),
-                block_on_validation_errors=cmds.checkBox(
-                    self.controls["block_export"],
-                    query=True,
-                    value=True,
-                ),
-            )
+            if batch_mode:
+                exported = []
 
-            if classification:
+                for obj in meshes:
+                    count = get_mesh_metric(
+                        obj, mode, count_material_splits=count_splits,
+                    )
+
+                    filepath = export_object_fbx(
+                        obj,
+                        export_folder,
+                        self._export_name_for(obj, count, auto_prefix),
+                        move_to_origin=move_origin,
+                        validate_before_export=validate,
+                        block_on_validation_errors=block,
+                        include_uv_checks=include_uv,
+                    )
+
+                    exported.append(filepath)
+
                 self.set_status(
-                    "Exported {0} as {1} with {2:,} {3}.".format(
-                        os.path.basename(filepath),
-                        classification["prefix"],
-                        count,
-                        mode.lower(),
+                    "Batch exported {0} file(s) to {1}".format(
+                        len(exported), export_folder,
                     )
                 )
+
             else:
+                active = get_active_mesh_transform() or meshes[0]
+
+                count = get_selection_metric(
+                    mode, count_material_splits=count_splits,
+                )
+
+                filepath = export_selected_fbx(
+                    export_folder,
+                    self._export_name_for(active, count, auto_prefix),
+                    validate_before_export=validate,
+                    block_on_validation_errors=block,
+                    include_uv_checks=include_uv,
+                )
+
                 self.set_status(
-                    "Exported {0}.".format(
-                        os.path.basename(filepath)
+                    "Exported {0} with {1:,} {2}.".format(
+                        os.path.basename(filepath), count, mode.lower(),
                     )
                 )
+
+            self.save_settings()
 
         except Exception as exc:
             self.set_status(
@@ -1629,7 +2540,129 @@ class JAMTAToolsUI(object):
             )
             cmds.warning(str(exc))
 
+    def _export_name_for(self, obj: str, count: int, auto_prefix: bool) -> str:
+        base_name = _short_name(obj)
+
+        if not auto_prefix:
+            return _strip_namespace(base_name)
+
+        export_name, _classification = export_name_with_prefix(
+            base_name,
+            count,
+            self.get_budget(),
+            self.get_margin(),
+            self.get_lp_prefix(),
+            self.get_hp_prefix(),
+        )
+
+        return export_name
+
+    def on_check_texel_density(self) -> None:
+        try:
+            texture_size = cmds.intFieldGrp(
+                self.controls["td_size"], query=True, value1=True,
+            )
+
+            density = get_selection_texel_density(texture_size)
+
+            if density is None:
+                message = "TD: no UV or surface area found on selection"
+            else:
+                message = "TD: {0:.3f} px/unit at {1}px textures".format(
+                    density, texture_size,
+                )
+
+            cmds.text(
+                self.controls["td_result"],
+                edit=True,
+                label=message,
+            )
+
+            self.set_status(message)
+
+        except Exception as exc:
+            self.set_status(
+                "Texel density check failed: {0}".format(exc)
+            )
+            cmds.warning(str(exc))
+
+    def on_set_texel_density(self) -> None:
+        try:
+            texture_size = cmds.intFieldGrp(
+                self.controls["td_size"], query=True, value1=True,
+            )
+            target = cmds.floatFieldGrp(
+                self.controls["td_target"], query=True, value1=True,
+            )
+
+            adjusted = set_selection_texel_density(target, texture_size)
+
+            self.set_status(
+                "Adjusted texel density on {0} object(s).".format(adjusted)
+            )
+
+            self.on_check_texel_density()
+
+        except Exception as exc:
+            self.set_status(
+                "Set texel density failed: {0}".format(exc)
+            )
+            cmds.warning(str(exc))
+
+    def on_create_ik(self) -> None:
+        try:
+            multiplier = cmds.floatFieldGrp(
+                self.controls["pole_mult"], query=True, value1=True,
+            )
+
+            handle, locator = create_ik_with_pole_vector(
+                pole_distance=multiplier,
+            )
+
+            self.set_status(
+                "Created {0} with pole vector {1}.".format(
+                    _short_name(handle), _short_name(locator),
+                )
+            )
+
+        except Exception as exc:
+            self.set_status(
+                "Create IK failed: {0}".format(exc)
+            )
+            cmds.warning(str(exc))
+
+    def on_create_muscle(self) -> None:
+        try:
+            axis = cmds.optionMenuGrp(
+                self.controls["muscle_axis"], query=True, value=True,
+            )
+            max_angle = cmds.floatFieldGrp(
+                self.controls["muscle_angle"], query=True, value1=True,
+            )
+            bulge = cmds.floatFieldGrp(
+                self.controls["muscle_bulge"], query=True, value1=True,
+            )
+
+            helper = create_muscle_helper(
+                rotate_axis=axis,
+                max_angle=max_angle,
+                bulge_scale=bulge,
+            )
+
+            self.set_status(
+                "Created {0}. Add it to the skinCluster and paint "
+                "weights to see the bulge.".format(_short_name(helper))
+            )
+
+        except Exception as exc:
+            self.set_status(
+                "Create muscle helper failed: {0}".format(exc)
+            )
+            cmds.warning(str(exc))
+
+
 _UI_INSTANCE: Optional[JAMTAToolsUI] = None
+
 
 def show() -> JAMTAToolsUI:
     """
@@ -1642,6 +2675,7 @@ def show() -> JAMTAToolsUI:
     _UI_INSTANCE.show()
 
     return _UI_INSTANCE
+
 
 if __name__ == "__main__":
     show()
